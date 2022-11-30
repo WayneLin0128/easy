@@ -24,6 +24,8 @@ import CaSEresnet12
 import CaSEresnet
 import CBAM_resnet12
 import CBAM_resnet
+import NAM_resnet
+import NAM_resnet12
 import s2m2
 import mlp
 print("models.")
@@ -321,6 +323,10 @@ def create_model():
         return CBAM_resnet12.ResNet12(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
     if args.model.lower() == "cbamresnet18":
         return CBAM_resnet.ResNet18(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
+    if args.model.lower() == "namresnet12":
+        return NAM_resnet12.ResNet12(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
+    if args.model.lower() == "namresnet18":
+        return NAM_resnet.ResNet18(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
     if args.model.lower()[:3] == "mlp":
         return mlp.MLP(args.feature_maps, int(args.model[3:]), input_shape, num_classes, args.rotations, few_shot).to(args.device)
     if args.model.lower() == "s2m2r":
