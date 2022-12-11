@@ -13,6 +13,7 @@ print("Using pytorch version: " + torch.__version__)
 print("Importing local files: ", end = '')
 from args import args
 from utils import *
+from tqdm import tqdm
 import datasets
 import few_shot_eval
 import resnet
