@@ -11,7 +11,7 @@ import sys
 print("Using pytorch version: " + torch.__version__)
 
 ### local imports
-print("Importing local files: ", end='')
+print("Importing local files: ", end="")
 from args import args
 from utils import *
 from tqdm import tqdm
