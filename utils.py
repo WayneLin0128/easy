@@ -6,6 +6,8 @@ import scipy.stats as st
 import numpy as np
 import random
 
+from mixed_precision import maybe_half
+
 ### generate random seeds
 random.seed(args.seed)
 np.random.seed(args.seed)
@@ -115,4 +117,38 @@ class LabelSmoothingLoss(nn.Module):
             true_dist.scatter_(1, target.data.unsqueeze(1), 1 - self.smoothing)
         return torch.mean(torch.sum(-true_dist * pred, dim=-1))
 
+class TwoCropTransform:
+    """Create two crops of the same image"""
+    def __init__(self, transform):
+        self.transform = transform
+
+    def __call__(self, x):
+        return [self.transform(x), self.transform(x)]
+
 print("utils, ", end='')
+
+def flatten(x):
+    return x.reshape(x.size(0), -1)
+
+
+def random_locs_2d(x, k_hot=1):
+    '''
+    Sample a k-hot mask over spatial locations for each set of conv features
+    in x, where x.shape is like (n_batch, n_feat, n_x, n_y).
+    '''
+    # assume x is (n_batch, n_feat, n_x, n_y)
+    x_size = x.size()
+    n_batch = x_size[0]
+    n_locs = x_size[2] * x_size[3]
+    idx_topk = torch.topk(torch.rand((n_batch, n_locs)), k=k_hot, dim=1)[1]
+    khot_mask = torch.zeros((n_batch, n_locs)).scatter_(1, idx_topk, 1.)
+    rand_locs = khot_mask.reshape((n_batch, 1, x_size[2], x_size[3]))
+    rand_locs = maybe_half(rand_locs)
+    return rand_locs
+
+class Flatten(nn.Module):
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, input_tensor):
+        return input_tensor.view(input_tensor.size(0), -1)

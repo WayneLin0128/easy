@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+
+import args
 from args import *
 from utils import *
 
@@ -137,13 +139,22 @@ def get_features(model, loader, n_aug = args.sample_aug):
     model.eval()
     for augs in range(n_aug):
         all_features, offset, max_offset = [], 1000000, 0
-        for batch_idx, (data, target) in enumerate(loader):        
+        for batch_idx, ((images1, images2), target) in enumerate(loader):
             with torch.no_grad():
-                data, target = data.to(args.device), target.to(args.device)
-                _, features = model(data)
+                images1, images2, target = images1.to(args.device), images2.to(args.device), target.to(args.device)
+                # _, features = model(x1=images1, x2=images2, class_only=True)
+                res_dict = model(x1=images1, x2=images2, class_only=True)
+                features = res_dict['rkhs_glb']
                 all_features.append(features)
                 offset = min(min(target), offset)
                 max_offset = max(max(target), max_offset)
+        # for batch_idx, (data, target) in enumerate(loader):
+        #     with torch.no_grad():
+        #         data, target = data.to(args.device), target.to(args.device)
+        #         _, features = model(data)
+        #         all_features.append(features)
+        #         offset = min(min(target), offset)
+        #         max_offset = max(max(target), max_offset)
         num_classes = max_offset - offset + 1
         print(".", end='')
         if augs == 0:

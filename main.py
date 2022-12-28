@@ -29,6 +29,12 @@ import NAM_resnet
 import NAM_resnet12
 import s2m2
 import mlp
+import amdimnet
+
+from costs import loss_xent
+import mixed_precision
+from stats import AverageMeterSet, update_train_accuracies
+from losses import SupConLoss
 print("models.")
 if args.ema > 0:
     from torch_ema import ExponentialMovingAverage
@@ -54,71 +60,119 @@ def crit(output, features, target):
 
 ### main train function
 def train(model, train_loader, optimizer, epoch, scheduler, mixup = False, mm = False):
+    model, optimizer = mixed_precision.initialize(model, optimizer)
     model.train()
     global last_update
     losses, total = 0., 0
-    
-    for batch_idx, (data, target) in enumerate(train_loader):
-            
-        data, target = data.to(args.device), target.to(args.device)
+    epoch_stats = AverageMeterSet()
+
+
+    """testing adding SinCLR loss"""
+    for batch_idx, ((images1, images2), target) in enumerate(train_loader):
+
+        images1 = images1.to(args.device)
+        images2 = images2.to(args.device)
+        target = torch.cat([target, target]).to(args.device)
+
+        res_dict = model(x1=images1, x2=images2, class_only=False)
+        lgt_glb_mlp, lgt_glb_lin = res_dict['class']
+
+        # compute costs for all self-supervised tasks
+        loss_g2l = (res_dict['g2l_1t5'] +
+                    res_dict['g2l_1t7'] +
+                    res_dict['g2l_5t5'])
+        loss_inf = loss_g2l + res_dict['lgt_reg']
+
+        # compute loss for online evaluation classifiers
+        loss = (loss_xent(lgt_glb_mlp, target) +
+                loss_xent(lgt_glb_lin, target))
+
+        loss_opt = loss_inf + loss
+        optimizer.zero_grad()
+        mixed_precision.backward(loss_opt, optimizer)  # special mixed precision stuff
+        optimizer.step()
+
+
+        epoch_stats.update('loss', loss_opt.item(), n=1)
+        update_train_accuracies(epoch_stats, target, lgt_glb_mlp, lgt_glb_lin)
+        # data_cat = torch.cat([data[0], data[1]], dim=0)
+        # # data = data[0]
+        # data, target, data_cat = data.to(args.device), target.to(args.device), data_cat.to(args.device)
+        #
+        # if torch.cuda.is_available():
+        #     data = data.cuda(non_blocking=True)
+        #     target = target.cuda(non_blocking=True)
+        #     data_cat = data_cat.cuda(non_blocking=True)
+        #
+        # bsz = target.shape[0]           # 128
+        #
+        # # compute loss
+        # output, features  = model(data_cat)
+        # f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+        # features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+        # criterion_Sup = SupConLoss(temperature=0.07)
+        # loss_sup = criterion_Sup(features, target)
+        # # loss_sup.backward()
+        #
+        # if mm:  # as in method S2M2R, to be used in combination with rotations
+        #     # if you do not understand what I just wrote, then just ignore this option, it might be better for now
+        #     new_chunks = []
+        #     sizes = torch.chunk(target, len(args.devices))
+        #     for i in range(len(args.devices)):
+        #         new_chunks.append(torch.randperm(sizes[i].shape[0]))
+        #     index_mixup = torch.cat(new_chunks, dim=0)
+        #     lam = np.random.beta(2, 2)
+        #     # output, features = model(data, index_mixup=index_mixup, lam=lam)
+        #     # f1, f2 = torch.split(features, [bsz, bsz], dim=0)
+        #     # features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+        #     if args.rotations:
+        #         output, _ = output
+        #     loss_mm = lam * criterion_Sup(features, target) + (1 - lam) * criterion_Sup(features, target[index_mixup])
+        #     # loss_mm.backward()
+        #
+        # if args.rotations:  # generate self-supervised rotations for improved universality of feature vectors
+        #     bs = data.shape[0] // 4
+        #     target_rot = torch.LongTensor(data.shape[0]).to(args.device)
+        #     target_rot[:bs] = 0
+        #     data[bs:] = data[bs:].transpose(3, 2).flip(2)
+        #     target_rot[bs:2 * bs] = 1
+        #     data[2 * bs:] = data[2 * bs:].transpose(3, 2).flip(2)
+        #     target_rot[2 * bs:3 * bs] = 2
+        #     data[3 * bs:] = data[3 * bs:].transpose(3, 2).flip(2)
+        #     target_rot[3 * bs:] = 3
+        #
+        # if mixup and args.mm:  # mixup or manifold_mixup
+        #     index_mixup = torch.randperm(data.shape[0])
+        #     lam = random.random()
+        #     if args.mm:
+        #         output, features = model(data, index_mixup=index_mixup, lam=lam)
+        #     else:
+        #         data_mixed = lam * data + (1 - lam) * data[index_mixup]
+        #         # output, features = model(data_mixed)
+        #     if args.rotations:
+        #         output, output_rot = output
+        #         loss = ((lam * criterion_Sup(features, target) + (1 - lam) * criterion_Sup(features, target[index_mixup])) + (
+        #                             lam * criterion_Sup(features, target_rot) + (1 - lam) * criterion_Sup(features, target_rot[index_mixup]))) / 2
+        #     else:
+        #         loss = lam * criterion_Sup(features, target) + (1 - lam) * criterion_Sup(output, features, target[index_mixup])
+        # else:
+        #     # output, features = model(data)
+        #     if args.rotations:
+        #         # output, output_rot = output
+        #         loss = 0.5 * criterion_Sup(features, target) + 0.5 * criterion_Sup(features, target_rot)
+        #     else:
+        #         loss = criterion_Sup(features, target)
 
         # reset gradients
-        optimizer.zero_grad()
-
-        if mm: # as in method S2M2R, to be used in combination with rotations
-            # if you do not understand what I just wrote, then just ignore this option, it might be better for now
-            new_chunks = []
-            sizes = torch.chunk(target, len(args.devices))
-            for i in range(len(args.devices)):
-                new_chunks.append(torch.randperm(sizes[i].shape[0]))
-            index_mixup = torch.cat(new_chunks, dim = 0)
-            lam = np.random.beta(2, 2)
-            output, features = model(data, index_mixup = index_mixup, lam = lam)
-            if args.rotations:
-                output, _ = output
-            loss_mm = lam * crit(output, features, target) + (1 - lam) * crit(output, features, target[index_mixup])
-            loss_mm.backward()
-
-        if args.rotations: # generate self-supervised rotations for improved universality of feature vectors
-            bs = data.shape[0] // 4
-            target_rot = torch.LongTensor(data.shape[0]).to(args.device)
-            target_rot[:bs] = 0
-            data[bs:] = data[bs:].transpose(3,2).flip(2)
-            target_rot[bs:2*bs] = 1
-            data[2*bs:] = data[2*bs:].transpose(3,2).flip(2)
-            target_rot[2*bs:3*bs] = 2
-            data[3*bs:] = data[3*bs:].transpose(3,2).flip(2)
-            target_rot[3*bs:] = 3
-
-        if mixup and args.mm: # mixup or manifold_mixup
-            index_mixup = torch.randperm(data.shape[0])
-            lam = random.random()            
-            if args.mm:
-                output, features = model(data, index_mixup = index_mixup, lam = lam)
-            else:
-                data_mixed = lam * data + (1 - lam) * data[index_mixup]
-                output, features = model(data_mixed)
-            if args.rotations:
-                output, output_rot = output
-                loss = ((lam * crit(output, features, target) + (1 - lam) * crit(output, features, target[index_mixup])) + (lam * crit(output_rot, features, target_rot) + (1 - lam) * crit(output_rot, features, target_rot[index_mixup]))) / 2
-            else:
-                loss = lam * crit(output, features, target) + (1 - lam) * crit(output, features, target[index_mixup])
-        else:
-            output, features = model(data)
-            if args.rotations:
-                output, output_rot = output
-                loss = 0.5 * crit(output, features, target) + 0.5 * crit(output_rot, features, target_rot)                
-            else:
-                loss = crit(output, features, target)
-
-        # backprop loss
-        loss.backward()
-            
-        losses += loss.item() * data.shape[0]
-        total += data.shape[0]
-        # update parameters
-        optimizer.step()
-        scheduler.step()
+        # optimizer.zero_grad()
+        # # backprop loss
+        # loss.backward()
+        #
+        # losses += loss.item() * data.shape[0]
+        total += images1.shape[0]
+        # # update parameters
+        # optimizer.step()
+        # scheduler.step()
         if args.ema > 0:
             ema.update()
 
@@ -129,13 +183,104 @@ def train(model, train_loader, optimizer, epoch, scheduler, mixup = False, mm = 
         # print advances if at least 100ms have passed since last print
         if (batch_idx + 1 == length) or (time.time() - last_update > 0.1) and not args.quiet:
             if batch_idx + 1 < length:
-                print("\r{:4d} {:4d} / {:4d} loss: {:.5f} time: {:s} lr: {:.5f} ".format(epoch, 1 + batch_idx, length, losses / total, format_time(time.time() - start_time), float(scheduler.get_last_lr()[0])), end = "")
+                print("\r{:4d} {:4d} / {:4d} loss: {:.5f} time: {:s} lr: {:.5f} ".format(epoch, 1 + batch_idx, length,
+                                                                                         loss / total, format_time(
+                        time.time() - start_time), float(scheduler.get_last_lr()[0])), end="")
             else:
-                print("\r{:4d} loss: {:.5f} ".format(epoch, losses / total), end = '')
+                print("\r{:4d} loss: {:.5f} ".format(epoch, loss / total), end='')
             last_update = time.time()
 
         if few_shot and total >= args.dataset_size and args.dataset_size > 0:
             break
+
+    if args.wandb:
+        wandb.log({"epoch": epoch, "train_loss": losses / total})
+
+    # return train_loss
+    return { "train_loss" : losses / total}
+
+    # for batch_idx, (data, target) in enumerate(train_loader):
+    #
+    #     # data = data[0]
+    #     data, target = data.to(args.device), target.to(args.device)
+    #
+    #     # print("data: ", len(data))        # 128 images
+    #     # print("target: ", len(target))    # 128 labels
+    #
+    #     # reset gradients
+    #     optimizer.zero_grad()
+    #
+    #     if mm: # as in method S2M2R, to be used in combination with rotations
+    #         # if you do not understand what I just wrote, then just ignore this option, it might be better for now
+    #         new_chunks = []
+    #         sizes = torch.chunk(target, len(args.devices))
+    #         for i in range(len(args.devices)):
+    #             new_chunks.append(torch.randperm(sizes[i].shape[0]))
+    #         index_mixup = torch.cat(new_chunks, dim = 0)
+    #         lam = np.random.beta(2, 2)
+    #         output, features = model(data, index_mixup = index_mixup, lam = lam)
+    #         if args.rotations:
+    #             output, _ = output
+    #         loss_mm = lam * crit(output, features, target) + (1 - lam) * crit(output, features, target[index_mixup])
+    #         loss_mm.backward()
+    #
+    #     if args.rotations: # generate self-supervised rotations for improved universality of feature vectors
+    #         bs = data.shape[0] // 4
+    #         target_rot = torch.LongTensor(data.shape[0]).to(args.device)
+    #         target_rot[:bs] = 0
+    #         data[bs:] = data[bs:].transpose(3,2).flip(2)
+    #         target_rot[bs:2*bs] = 1
+    #         data[2*bs:] = data[2*bs:].transpose(3,2).flip(2)
+    #         target_rot[2*bs:3*bs] = 2
+    #         data[3*bs:] = data[3*bs:].transpose(3,2).flip(2)
+    #         target_rot[3*bs:] = 3
+    #
+    #     if mixup and args.mm: # mixup or manifold_mixup
+    #         index_mixup = torch.randperm(data.shape[0])
+    #         lam = random.random()
+    #         if args.mm:
+    #             output, features = model(data, index_mixup = index_mixup, lam = lam)
+    #         else:
+    #             data_mixed = lam * data + (1 - lam) * data[index_mixup]
+    #             output, features = model(data_mixed)
+    #         if args.rotations:
+    #             output, output_rot = output
+    #             loss = ((lam * crit(output, features, target) + (1 - lam) * crit(output, features, target[index_mixup])) + (lam * crit(output_rot, features, target_rot) + (1 - lam) * crit(output_rot, features, target_rot[index_mixup]))) / 2
+    #         else:
+    #             loss = lam * crit(output, features, target) + (1 - lam) * crit(output, features, target[index_mixup])
+    #     else:
+    #         output, features = model(data)
+    #         if args.rotations:
+    #             output, output_rot = output
+    #             loss = 0.5 * crit(output, features, target) + 0.5 * crit(output_rot, features, target_rot)
+    #         else:
+    #             loss = crit(output, features, target)
+    #
+    #     # backprop loss
+    #     loss.backward()
+    #
+    #     losses += loss.item() * data.shape[0]
+    #     total += data.shape[0]
+    #     # update parameters
+    #     optimizer.step()
+    #     scheduler.step()
+    #     if args.ema > 0:
+    #         ema.update()
+    #
+    #     if few_shot and args.dataset_size > 0:
+    #         length = args.dataset_size // args.batch_size + (1 if args.dataset_size % args.batch_size != 0 else 0)
+    #     else:
+    #         length = len(train_loader)
+    #     # print advances if at least 100ms have passed since last print
+    #     if (batch_idx + 1 == length) or (time.time() - last_update > 0.1) and not args.quiet:
+    #         if batch_idx + 1 < length:
+    #             print("\r{:4d} {:4d} / {:4d} loss: {:.5f} time: {:s} lr: {:.5f} ".format(epoch, 1 + batch_idx, length, losses / total, format_time(time.time() - start_time), float(scheduler.get_last_lr()[0])), end = "")
+    #         else:
+    #             print("\r{:4d} loss: {:.5f} ".format(epoch, losses / total), end = '')
+    #         last_update = time.time()
+    #
+    #     if few_shot and total >= args.dataset_size and args.dataset_size > 0:
+    #         break
             
     if args.wandb:
         wandb.log({"epoch":epoch, "train_loss": losses / total})
@@ -308,6 +453,10 @@ def create_model():
         return resnet.ResNet18(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
     if args.model.lower() == "resnet20":
         return resnet.ResNet20(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
+    if args.model.lower() == "resnet34":
+        return resnet.ResNet34(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
+    if args.model.lower() == "resnet50":
+        return resnet.ResNet50(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
     if args.model.lower() == "wideresnet":
         return wideresnet.WideResNet(args.feature_maps, input_shape, few_shot, args.rotations, num_classes = num_classes).to(args.device)
     if args.model.lower() == "resnet12":
@@ -328,6 +477,8 @@ def create_model():
         return NAM_resnet12.ResNet12(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
     if args.model.lower() == "namresnet18":
         return NAM_resnet.ResNet18(args.feature_maps, input_shape, num_classes, few_shot, args.rotations).to(args.device)
+    if args.model.lower() == "amdimnet":
+        return amdimnet.AmdimNet(ndf=128, n_classes=num_classes, n_rkhs=1024, tclip=20.0, n_depth=3, encoder_size=32, use_bn=True).to(args.device)
     if args.model.lower()[:3] == "mlp":
         return mlp.MLP(args.feature_maps, int(args.model[3:]), input_shape, num_classes, args.rotations, few_shot).to(args.device)
     if args.model.lower() == "s2m2r":
